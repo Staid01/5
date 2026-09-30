@@ -162,9 +162,63 @@ def extract_rust(path: Path) -> dict:
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
+    # Pre-scan the struct/enum/trait names declared in this file so a type used
+    # above its declaration resolves exactly as a use below it already does,
+    # rather than to a sourceless stub that the corpus-level rewire only folds
+    # back when the name is unique across the corpus (#3782). Only these three
+    # items are pre-registered: walk() never makes a node of a `type` alias or a
+    # `union`, so registering one would leave its references pointing at no node.
+    # The scan never descends further than walk() does, so every id registered
+    # here ends up as a node. Ids are casefolded, so `fn handle` and
+    # `struct Handle` (or `struct HANDLE` and `struct Handle`) share one and
+    # walk() keeps whichever comes first: a type is only pre-registered when
+    # every file-level item behind its id is that same type (`#[cfg]` twins count
+    # once), and it is matched by its exact name, since a `type HANDLE` alias or
+    # an imported `HANDLE` shares the id of a local `struct Handle`. Otherwise the
+    # forward reference keeps the sourceless stub v8's extractor gives it. An
+    # `impl` block counts as the type it names, because walk() gives it the node
+    # of its type text (`impl Tr for HANDLE` collides with `struct Handle`,
+    # `impl Tr for &Handle<'_>` does not); methods and impl-scoped items have
+    # impl-qualified ids and are not counted.
+    items_by_id: dict[str, set[tuple[bool, str]]] = {}
+    declared_type_ids: set[str] = set()
+
+    def _scan_type_items(node) -> None:
+        t = node.type
+        if t in ("struct_item", "enum_item", "trait_item", "function_item",
+                 "function_signature_item", "static_item", "const_item"):
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = _read_text(name_node, source)
+                nid = _make_id(stem, name)
+                is_type = t in ("struct_item", "enum_item", "trait_item")
+                items_by_id.setdefault(nid, set()).add((is_type, name))
+                if is_type:
+                    declared_type_ids.add(nid)
+            return
+        if t == "impl_item":
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                type_name = _read_text(type_node, source).strip()
+                refs: list[tuple[str, str]] = []
+                _rust_collect_type_refs(type_node, source, False, refs)
+                bare = next((ref for ref, role in refs if role == "type"), type_name)
+                items_by_id.setdefault(_make_id(stem, type_name), set()).add((True, bare))
+            return
+        if t == "use_declaration":
+            return
+        for child in node.children:
+            _scan_type_items(child)
+
+    _scan_type_items(root)
+    local_type_names = {
+        next(iter(items))[1] for nid, items in items_by_id.items()
+        if nid in declared_type_ids and len(items) == 1
+    }
+
     def ensure_named_node(name: str, line: int) -> str:
         nid = _make_id(stem, name)
-        if nid in seen_ids:
+        if nid in seen_ids or name in local_type_names:
             return nid
         nid = _make_id(name)
         if nid not in seen_ids:
